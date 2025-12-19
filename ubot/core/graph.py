@@ -50,8 +50,44 @@ def clone_state(s: UBotState) -> UBotState:
     return UBotState(
         adj={u: dict(ports) for u, ports in s.adj.items()},
         ports=list(s.ports),
-        q=None if s.q is None else list(s.q),
+        q=None if s.q is None else {mid: list(vals) for mid, vals in s.q.items()},
+        parent=None if s.parent is None else {mid: p for mid, p in s.parent.items()},
+        pose=None
+        if s.pose is None
+        else {mid: tuple(float(v) for v in vals) for mid, vals in s.pose.items()},
+        weld=None
+        if s.weld is None
+        else {(int(u), str(pu), int(v), str(pv)): tuple(float(x) for x in tf) for (u, pu, v, pv), tf in s.weld.items()},
     )
+
+
+def compute_parent_map(s: UBotState, root: int = 0) -> Dict[int, Optional[int]]:
+    """
+    Compute a BFS tree rooted at `root`. Unreachable modules get parent=None.
+    """
+    parents: Dict[int, Optional[int]] = {m: None for m in s.adj.keys()}
+    if root not in s.adj:
+        return parents
+
+    frontier = [root]
+    visited = {root}
+    parents[root] = None
+
+    while frontier:
+        u = frontier.pop()
+        for _pu, (v, _pv) in s.adj.get(u, {}).items():
+            if v in visited:
+                continue
+            visited.add(v)
+            parents[v] = u
+            frontier.append(v)
+
+    return parents
+
+
+def init_pose_zero(s: UBotState) -> Dict[int, Tuple[float, float, float, float]]:
+    """Backward-compat placeholder (deprecated)."""
+    return {m: (0.0, 0.0, 0.0, 0.0) for m in s.adj.keys()}
 
 def free_ports(s: UBotState, u: int) -> List[Port]:
     used = set(s.adj.get(u, {}).keys())

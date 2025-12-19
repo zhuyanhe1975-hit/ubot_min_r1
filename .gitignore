@@ -30,8 +30,12 @@ mjkey.txt
 scene_*.xml
 *_generated.xml
 *_out.xml
+tmp*.xml
 *.log
 *.jsonl
+
+# ===== Local scratch JSON =====
+random_state*.json
 
 # ===== OS =====
 .DS_Store
