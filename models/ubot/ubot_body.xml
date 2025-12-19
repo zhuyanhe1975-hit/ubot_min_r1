@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mujoco>
+  <body name="ubot" pos="0 0 0">
+      <!-- ax is purely structural: no geom, no connection faces -->
+      <geom name="ax" type="mesh" mesh="ubot_ax"  material="ubot_gray" contype="1" conaffinity="1" />
+      <!-- ================= -->
+      <!-- Half module A (ma) -->
+      <!-- ================= -->
+      <body name="ma" pos="0 0 0">
+        <!-- Joint: ax -> ma -->
+        <joint
+          name="j_ax_ma"
+          type="hinge"
+          axis="1 0 0"
+          pos="0 0 0"
+          range="-90 90"/>
+
+        <!-- geometry (placeholder) -->
+        <geom name="ma" type="mesh" mesh="ubot_ma" material="ubot_red" contype="2" conaffinity="2" />
+  
+        <!-- sites: +Z outward normal = (origin->site), +Y = body +Y -->
+        <!-- ma_connector_right: pos = +X => z = +X, y = +Y -->
+        <site
+          name="ma_connector_right"
+          pos="0.05 0.0 0.0"
+          quat="0.70710678 0 0.70710678 0"
+          size="0.01"/>
+        <!-- ma_connector_bottom: pos = -Z => z = -Z, y = +Y -->
+        <site
+          name="ma_connector_bottom"
+          pos="0.0 0.0 -0.05"
+          quat="0 0 1 0"
+          size="0.01"/>
+
+        <!-- Connection faces (semantic only, Phase-1) -->
+        <!-- ma_right, ma_down -->
+      </body>
+
+      <!-- ================= -->
+      <!-- Half module B (mb) -->
+      <!-- ================= -->
+      <body name="mb" pos="0 0 0">
+        <!-- Joint: ax -> mb -->
+        <joint
+          name="j_ax_mb"
+          type="hinge"
+          axis="0 0 1"
+          pos="0 0 0"
+          range="-90 90"/>
+
+        <geom name="mb" type="mesh" mesh="ubot_mb"  material="ubot_green"  contype="4" conaffinity="4" />
+
+        <!-- mb_connector_left: pos = -X => z = -X, y = +Y -->
+        <site
+          name="mb_connector_left"
+          pos="-0.05 0.0 0.0"
+          quat="0.70710678 0 -0.70710678 0"
+          size="0.01"/>
+        <!-- mb_connector_up: pos = +Z => z = +Z, y = +Y -->
+        <site
+          name="mb_connector_top"
+          pos="0.0 0.0 0.05"
+          quat="1 0 0 0"
+          size="0.01"/>
+
+        <!-- Connection faces -->
+        <!-- mb_left, mb_up -->
+      </body>
+
+    </body>
+</mujoco>

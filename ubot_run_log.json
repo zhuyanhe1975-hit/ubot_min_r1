@@ -1,0 +1,38 @@
+{
+  "meta": {
+    "planner": "astar",
+    "runtime_sec": 0.00010848045349121094
+  },
+  "plan": [
+    {
+      "kind": "DETACH",
+      "u": 1,
+      "v": 2,
+      "pu": null,
+      "pv": null
+    },
+    {
+      "kind": "ATTACH",
+      "u": 1,
+      "v": 2,
+      "pu": "S",
+      "pv": "N"
+    }
+  ],
+  "executed": [
+    {
+      "kind": "DETACH",
+      "u": 1,
+      "v": 2,
+      "pu": null,
+      "pv": null
+    },
+    {
+      "kind": "ATTACH",
+      "u": 1,
+      "v": 2,
+      "pu": "S",
+      "pv": "N"
+    }
+  ]
+}

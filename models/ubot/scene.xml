@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mujoco>
+  <compiler meshdir="." />
+
+  <!-- 资产只 include 一次 -->
+  <include file="ubot_assets.xml"/>
+
+  <worldbody>
+    <replicate count="4" offset="0.1 0 0" sep="_">
+      <!-- 单模块模板 -->
+      <include file="ubot_body.xml"/>
+    </replicate>
+  </worldbody>
+</mujoco>

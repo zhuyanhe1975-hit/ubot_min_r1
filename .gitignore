@@ -1,0 +1,42 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.pytest_cache/
+
+# ===== Virtual environments =====
+env/
+venv/
+.venv/
+conda/
+miniconda/
+anaconda/
+
+# ===== VSCode =====
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# ===== MuJoCo / simulation =====
+mujoco/
+.mujoco/
+mjkey.txt
+
+# ===== Generated scenes / logs =====
+scene_*.xml
+*_generated.xml
+*_out.xml
+*.log
+*.jsonl
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+
+# ===== C/C++ build =====
+build/
+cmake-build-*/

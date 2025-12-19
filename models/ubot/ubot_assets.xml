@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mujoco>
+  <asset>
+    <mesh name="ubot_ma" file="ma.obj"/>
+    <mesh name="ubot_mb" file="mb.obj"/>
+    <mesh name="ubot_ax" file="ax.obj"/>
+
+    <material name="ubot_gray" rgba="0.7 0.7 0.7 1"/>
+    <material name="ubot_red" rgba="0.5 0.0 0.0 1"/>
+    <material name="ubot_green" rgba="0.0 0.5 0.0 1"/>
+  </asset>
+</mujoco>
