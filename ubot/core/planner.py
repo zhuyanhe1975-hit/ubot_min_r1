@@ -14,6 +14,9 @@ from ubot.core.kinematics import (
     ensure_welds_from_pose,
     compute_weld_from_pose,
     tf_inv,
+    tf_mul,
+    port_tf_in_ax,
+    weld_tf,
 )
 
 def _joints_or_zero(s: UBotState) -> Dict[int, List[float]]:
@@ -285,6 +288,275 @@ def _align_ports_by_path_joints_multi(
     return out
 
 
+def _tf_hash(t: Transform, nd: int = 6) -> Tuple[float, ...]:
+    p = tuple(round(float(x), nd) for x in t.p.tolist())
+    R = tuple(round(float(x), nd) for x in t.R.reshape(-1).tolist())
+    return p + R
+
+
+def _tf_identity() -> Transform:
+    import numpy as np
+
+    return Transform(p=np.zeros(3), R=np.eye(3))
+
+
+def _ports_aligned_in_uport_frame(T_uport_to_vport: Transform, *, pos_tol: float = 1e-4, cos_tol: float = 0.95) -> bool:
+    import numpy as np
+
+    if float(np.linalg.norm(T_uport_to_vport.p)) > pos_tol:
+        return False
+    z = T_uport_to_vport.R[:, 2]
+    if float(np.dot(z, np.array([0.0, 0.0, 1.0]))) > -cos_tol:
+        return False
+    return True
+
+
+def _align_ports_by_path_dp(
+    s: UBotState,
+    u: int,
+    pu: str,
+    v: int,
+    pv: str,
+    path_nodes: List[int],
+    *,
+    max_states_per_layer: int = 2000,
+) -> Optional[Dict[int, List[float]]]:
+    """
+    Faster inner solver for a path: DP over discrete joints along `path_nodes` to align (u,pu) with (v,pv).
+
+    Computes the relative transform from u_port to v_port in u_port frame by chaining per-edge transforms:
+      T_ax_{i+1} = T_ax_i * (T_ax_i->ax_{i+1})(q_i, q_{i+1})
+    and tests final T_uport->vport for position~=0 and z-opposed.
+    """
+    if not path_nodes or path_nodes[0] != u or path_nodes[-1] != v:
+        return None
+    if s.weld is None:
+        return None
+
+    allowed = _allowed_joint_pairs()
+    base_q = dict(_joints_or_zero(s))
+
+    # Per-node candidate joint pairs ordered by closeness to current joints
+    per_node_allowed: List[List[Tuple[float, float]]] = []
+    for mid in path_nodes:
+        cur_j1, cur_j2 = (base_q.get(mid, [0.0, 0.0])[0], base_q.get(mid, [0.0, 0.0])[1])
+
+        def score(pair: Tuple[float, float]) -> Tuple[float, float, float]:
+            j1, j2 = pair
+            return (abs(j1 - cur_j1) + abs(j2 - cur_j2), abs(j1 - cur_j1), abs(j2 - cur_j2))
+
+        per_node_allowed.append(sorted(allowed, key=score))
+
+    # Build directed edges info along the path: for i -> i+1, get ports pi (on i), pj (on j).
+    path_ports: List[Tuple[str, str]] = []
+    for a, b in zip(path_nodes[:-1], path_nodes[1:]):
+        pi = pj = None
+        for p_a, (bb, p_b) in s.adj.get(a, {}).items():
+            if bb == b:
+                pi, pj = p_a, p_b
+                break
+        if pi is None or pj is None:
+            return None
+        path_ports.append((pi, pj))
+
+    # Cache per-edge transform for joint pairs: (a,pi,b,pj, qa, qb) -> Transform
+    edge_cache: Dict[Tuple, Transform] = {}
+
+    def edge_tf(a: int, pi: str, b: int, pj: str, qa: Tuple[float, float], qb: Tuple[float, float]) -> Transform:
+        key = (a, pi, b, pj, qa[0], qa[1], qb[0], qb[1])
+        if key in edge_cache:
+            return edge_cache[key]
+        X = weld_tf(s, a, pi, b, pj)
+        Ta = port_tf_in_ax(pi, qa[0], qa[1])
+        Tb = port_tf_in_ax(pj, qb[0], qb[1])
+        Tij = tf_mul(tf_mul(Ta, X), tf_inv(Tb))  # ax_a -> ax_b
+        edge_cache[key] = Tij
+        return Tij
+
+    # DP layers:
+    # layer[idx][q_idx][tf_hash] = backpointer
+    # backpointer: (prev_q_idx, prev_tf_hash, q_pair)
+    layers: List[Dict[int, Dict[Tuple[float, ...], Tuple[int, Tuple[float, ...], Tuple[float, float]]]]] = []
+
+    # layer 0: at u, T_ax_u->ax_u = I
+    layer0: Dict[int, Dict[Tuple[float, ...], Tuple[int, Tuple[float, ...], Tuple[float, float]]]] = {}
+    for q_pair in per_node_allowed[0]:
+        q_idx = allowed.index(q_pair)
+        t0 = _tf_identity()
+        layer0.setdefault(q_idx, {})[_tf_hash(t0)] = (-1, (), q_pair)
+    layers.append(layer0)
+
+    # forward propagate
+    for step, ((a, b), (pi, pj)) in enumerate(zip(zip(path_nodes[:-1], path_nodes[1:]), path_ports), start=0):
+        prev_layer = layers[-1]
+        next_layer: Dict[int, Dict[Tuple[float, ...], Tuple[int, Tuple[float, ...], Tuple[float, float]]]] = {}
+
+        # cap breadth
+        total_prev = sum(len(d) for d in prev_layer.values())
+        if total_prev > max_states_per_layer:
+            # keep arbitrary subset (stable by insertion)
+            kept = 0
+            pruned: Dict[int, Dict[Tuple[float, ...], Tuple[int, Tuple[float, ...], Tuple[float, float]]]] = {}
+            for q_idx, d in prev_layer.items():
+                for th, bp in d.items():
+                    pruned.setdefault(q_idx, {})[th] = bp
+                    kept += 1
+                    if kept >= max_states_per_layer:
+                        break
+                if kept >= max_states_per_layer:
+                    break
+            prev_layer = pruned
+
+        for q_idx, tf_map in prev_layer.items():
+            qa = allowed[q_idx]
+            for tfh_prev, (bp_q, bp_th, bp_pair) in tf_map.items():
+                # reconstruct Transform for this hash? store actual Transform is expensive;
+                # Instead, keep alongside hash by reusing computed chain using backpointers is complex.
+                # Practical compromise: decode back from hash into Transform.
+                import numpy as np
+
+                p = np.array(tfh_prev[0:3], dtype=float)
+                R = np.array(tfh_prev[3:12], dtype=float).reshape(3, 3)
+                T_u_to_a = Transform(p=p, R=R)
+
+                for qb in per_node_allowed[step + 1]:
+                    qj = allowed.index(qb)
+                    Tij = edge_tf(a, pi, b, pj, qa, qb)
+                    T_u_to_b = tf_mul(T_u_to_a, Tij)
+                    th = _tf_hash(T_u_to_b)
+                    # store first found (ordered by closeness to current, tends to be low-motion)
+                    if th not in next_layer.setdefault(qj, {}):
+                        next_layer[qj][th] = (q_idx, tfh_prev, qb)
+
+        layers.append(next_layer)
+
+    # terminal check at v
+    final_layer = layers[-1]
+    if not final_layer:
+        return None
+
+    # For each joint state at u and v, we need to compute uport->vport
+    # We don't track q_u in DP state explicitly; it's the first layer backpointer pair.
+    for qv_idx, tf_map in final_layer.items():
+        qv = allowed[qv_idx]
+        for tfh, (prev_q_idx, prev_th, qb_pair) in tf_map.items():
+            import numpy as np
+
+            p = np.array(tfh[0:3], dtype=float)
+            R = np.array(tfh[3:12], dtype=float).reshape(3, 3)
+            T_u_to_v = Transform(p=p, R=R)
+
+            # recover q_u from layer0 backpointer (stored in layers[0])
+            # layer0 stores bp with q_pair itself; pick matching entry by searching back pointers chain.
+            # Backtrack joints for all nodes and then evaluate alignment.
+            joints_seq: List[Tuple[float, float]] = [qv]
+            cur_q_idx = qv_idx
+            cur_th = tfh
+            for layer_i in range(len(path_nodes) - 1, 0, -1):
+                bp = layers[layer_i][cur_q_idx][cur_th]
+                prev_q_idx, prev_th, q_pair = bp
+                joints_seq.append(allowed[prev_q_idx] if prev_q_idx >= 0 else q_pair)
+                cur_q_idx, cur_th = prev_q_idx, prev_th
+            joints_seq.reverse()
+            qu = joints_seq[0]
+
+            T_uport = port_tf_in_ax(pu, qu[0], qu[1])
+            T_vport = port_tf_in_ax(pv, qv[0], qv[1])
+            T_uport_to_vport = tf_mul(tf_mul(tf_inv(T_uport), T_u_to_v), T_vport)
+            if not _ports_aligned_in_uport_frame(T_uport_to_vport):
+                continue
+
+            return {mid: [float(j1), float(j2)] for mid, (j1, j2) in zip(path_nodes, joints_seq)}
+
+    return None
+
+
+def compute_tree_edge_swaps(start: UBotState, goal: UBotState) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
+    """
+    Compute a deterministic sequence of edge-swaps to transform start tree into goal tree (ignoring port labels).
+
+    Each swap is (add_edge(u,v), remove_edge(a,b)), where remove_edge lies on the created cycle and is not in goal.
+    Preconditions (for deterministic behavior):
+      - start and goal are connected trees over the same node set.
+    """
+    def pair_set(s: UBotState) -> Set[Tuple[int, int]]:
+        return set((e.u, e.v) for e in edges_undirected(s))
+
+    start_pairs = set(tuple(sorted(p)) for p in pair_set(start))
+    goal_pairs = set(tuple(sorted(p)) for p in pair_set(goal))
+    if start_pairs == goal_pairs:
+        return []
+    # Trees: |E| = |V|-1
+    if len(start_pairs) != len(start.adj) - 1 or len(goal_pairs) != len(goal.adj) - 1:
+        raise ValueError("compute_tree_edge_swaps expects trees (|E|=|V|-1).")
+
+    swaps: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
+    cur_pairs = set(start_pairs)
+
+    def build_adj(pairs: Set[Tuple[int, int]]) -> Dict[int, List[int]]:
+        adj = {m: [] for m in start.adj.keys()}
+        for a, b in pairs:
+            adj[a].append(b)
+            adj[b].append(a)
+        return adj
+
+    def find_path(adj: Dict[int, List[int]], src: int, dst: int) -> List[int]:
+        from collections import deque
+
+        prev = {src: None}
+        q = deque([src])
+        while q:
+            x = q.popleft()
+            if x == dst:
+                break
+            for y in adj.get(x, []):
+                if y in prev:
+                    continue
+                prev[y] = x
+                q.append(y)
+        if dst not in prev:
+            raise ValueError("Tree path not found (graph disconnected?)")
+        nodes: List[int] = []
+        cur = dst
+        while cur is not None:
+            nodes.append(cur)
+            cur = prev[cur]
+        nodes.reverse()
+        return nodes
+
+    while cur_pairs != goal_pairs:
+        missing = sorted(list(goal_pairs - cur_pairs))
+        extra = set(cur_pairs - goal_pairs)
+        if not missing:
+            break
+
+        # choose missing edge that yields the shortest cycle (shortest path) to reduce inner complexity
+        best = None
+        cur_adj = build_adj(cur_pairs)
+        for (u, v) in missing:
+            path = find_path(cur_adj, u, v)
+            plen = len(path)
+            cand = (plen, u, v, path)
+            if best is None or cand < best:
+                best = cand
+        assert best is not None
+        _plen, u, v, path = best
+
+        # cycle edges are along path (u..v)
+        cycle_edges = set(tuple(sorted((a, b))) for a, b in zip(path[:-1], path[1:]))
+        removable = sorted(list(cycle_edges & extra))
+        if not removable:
+            raise ValueError("No removable edge on cycle; goal might be inconsistent for tree transform.")
+        # deterministic: remove the first removable edge
+        a, b = removable[0]
+
+        swaps.append(((u, v), (a, b)))
+        cur_pairs.add(tuple(sorted((u, v))))
+        cur_pairs.remove(tuple(sorted((a, b))))
+
+    return swaps
+
+
 def plan_hierarchical_edge_swap(
     start: UBotState,
     goal: UBotState,
@@ -341,96 +613,70 @@ def plan_hierarchical_edge_swap(
         s2 = apply_seq(s, seq)
         return seq if s2 is not None else None
 
-    # Fast path for tree->tree topology problems: bounded DFS over edge-swaps.
+    # Deterministic outer topology plan for tree->tree (ignoring ports), then align each swap using DP.
     if ignore_ports:
-        goal_pairs = set((u, v) for (u, v, _a, _b) in goal_edges)
+        from ubot.adapters.sim_adapter import SimAdapter
 
-        def sig_pairs_joints(s: UBotState) -> Tuple:
-            pairs = tuple(sorted(pair_set(s)))
-            joints = tuple((m, float(v[0]), float(v[1])) for m, v in sorted(_joints_or_zero(s).items()))
-            return pairs + joints
+        try:
+            swaps = compute_tree_edge_swaps(start, goal)
+        except Exception:
+            swaps = []
 
-        def dfs(s: UBotState, depth: int, seen: Set[Tuple]) -> Optional[List[Action]]:
-            cur_pairs = pair_set(s)
-            if cur_pairs == goal_pairs:
-                tail = fix_joints_seq(s)
-                return tail if tail is not None else None
-            if depth <= 0:
-                return None
+        adapter = SimAdapter(start)
+        plan: List[Action] = []
+        for (u, v), (a, b) in swaps:
+            st = adapter.get_state()
+            # Ports free list (limit tries)
+            free_u = free_ports(st, u)
+            free_v = free_ports(st, v)
+            port_pairs = [(pu, pv) for pu in free_u for pv in free_v]
+            if max_port_pairs > 0:
+                port_pairs = port_pairs[:max_port_pairs]
 
-            key = sig_pairs_joints(s)
-            if key in seen:
-                return None
-            seen.add(key)
+            # Path on current tree between u and v
+            path_nodes, _path_edges = _find_path_nodes_and_edges(st, u, v)
 
-            missing_pairs = sorted(list(goal_pairs - cur_pairs))
-            extra_pairs = set(cur_pairs - goal_pairs)
-
-            # Prefer shorter paths first.
-            scored = []
-            for (u, v) in missing_pairs:
-                pn, pe = _find_path_nodes_and_edges(s, u, v)
-                scored.append((len(pn), u, v, pn, pe))
-            scored.sort()
-
-            for _plen, u, v, path_nodes, path_edges in scored:
-                free_u = free_ports(s, u)
-                free_v = free_ports(s, v)
-                port_pairs = [(pu, pv) for pu in free_u for pv in free_v]
-                if max_port_pairs > 0:
-                    port_pairs = port_pairs[:max_port_pairs]
-
-                removable = [e for e in path_edges if (e.u, e.v) in extra_pairs]
-                if not removable:
+            best_seq: Optional[List[Action]] = None
+            best_cost = 10**9
+            for pu, pv in port_pairs:
+                jm = _align_ports_by_path_dp(st, u, pu, v, pv, path_nodes)
+                if jm is None:
                     continue
+                cur_q = _joints_or_zero(st)
+                joint_actions: List[Action] = []
+                for mid in path_nodes:
+                    tgt = jm.get(mid, cur_q.get(mid, [0.0, 0.0]))
+                    if cur_q.get(mid, [0.0, 0.0]) != tgt:
+                        joint_actions.append(
+                            Action(kind="SET_JOINTS", u=mid, v=mid, j1=float(tgt[0]), j2=float(tgt[1]))
+                        )
+                seq = joint_actions + [Action(kind="ATTACH", u=u, v=v, pu=pu, pv=pv)] + [Action(kind="DETACH", u=a, v=b)]
+                s2 = apply_seq(st, seq)
+                if s2 is None:
+                    continue
+                cost = len(seq)
+                if cost < best_cost:
+                    best_cost = cost
+                    best_seq = seq
 
-                for (pu, pv) in port_pairs:
-                    if pu in s.adj.get(u, {}):
-                        continue
-                    if pv in s.adj.get(v, {}):
-                        continue
+            if best_seq is None:
+                return None
+            for act in best_seq:
+                adapter.apply(act)
+                plan.append(act)
 
-                    joint_maps = _align_ports_by_path_joints_multi(
-                        s,
-                        u,
-                        pu,
-                        v,
-                        pv,
-                        path_nodes,
-                        max_tries=max_inner_tries,
-                        max_solutions=max_inner_solutions,
-                    )
-                    if not joint_maps:
-                        continue
-
-                    for joints_map in joint_maps:
-                        joint_actions: List[Action] = []
-                        cur_q = _joints_or_zero(s)
-                        for mid in sorted(joints_map.keys()):
-                            tgt = joints_map[mid]
-                            if cur_q.get(mid, [0.0, 0.0]) != tgt:
-                                joint_actions.append(
-                                    Action(kind="SET_JOINTS", u=mid, v=mid, j1=float(tgt[0]), j2=float(tgt[1]))
-                                )
-
-                        for e_remove in removable:
-                            seq = (
-                                joint_actions
-                                + [Action(kind="ATTACH", u=u, v=v, pu=pu, pv=pv)]
-                                + [Action(kind="DETACH", u=e_remove.u, v=e_remove.v)]
-                            )
-                            s2 = apply_seq(s, seq)
-                            if s2 is None:
-                                continue
-                            tail = dfs(s2, depth - 1, seen)
-                            if tail is not None:
-                                return seq + tail
-
+        # Fix joints to goal (still must keep existing geometry valid).
+        tail = fix_joints_seq(adapter.get_state())
+        if tail is None:
             return None
+        for act in tail:
+            adapter.apply(act)
+            plan.append(act)
 
-        # Depth heuristic: each swap can fix at most one missing pair.
-        depth0 = min(max_swaps, len(goal_pairs - pair_set(start)) + 2)
-        return dfs(start, depth0, set())
+        # Final check (ignore ports)
+        if set(tuple(sorted(p)) for p in pair_set(adapter.get_state())) != set(tuple(sorted(p)) for p in pair_set(goal)):
+            return None
+        return plan
 
     start_sig = state_sig(start)
     pq: List[Tuple[int, int, int, Tuple[UBotState, List[Action]]]] = []
