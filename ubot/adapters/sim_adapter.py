@@ -54,8 +54,9 @@ class SimAdapter(UBotAdapter):
             self._state.q[action.u] = [float(action.j1), float(action.j2)]
         # Maintain parent map rooted at module 0 ax
         self._state.parent = compute_parent_map(self._state, root=0)
-        # Update ax world poses using kinematic constraints, without teleport.
-        self._update_poses()
+        # Pose update: joints cause kinematic motion; attach/detach do not.
+        if action.kind == "SET_JOINTS":
+            self._update_poses()
 
     def _update_poses(self) -> None:
         """
