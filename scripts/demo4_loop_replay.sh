@@ -18,4 +18,3 @@ exec env/bin/python -m ubot.apps.show_mujoco \
   --log "$PLAN_LOG" \
   --step_dt "$STEP_DT" \
   --interp_steps "$INTERP_STEPS"
-

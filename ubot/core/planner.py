@@ -112,11 +112,17 @@ def _allowed_joint_pairs() -> List[Tuple[float, float]]:
     # Must match validator.validate_joints
     return [
         (-90.0, -90.0),
+        (-45.0, -45.0),
         (-90.0, 0.0),
+        (-45.0, 0.0),
         (0.0, -90.0),
+        (0.0, -45.0),
         (0.0, 0.0),
+        (0.0, 45.0),
         (0.0, 90.0),
+        (45.0, 0.0),
         (90.0, 0.0),
+        (45.0, 45.0),
         (90.0, 90.0),
     ]
 
@@ -811,15 +817,7 @@ def candidate_actions(s: UBotState, goal: UBotState) -> List[Action]:
         for (u, v, _pu, _pv) in missing_edges:
             involved.add(u)
             involved.add(v)
-        valid_pairs = [
-            (-90.0, -90.0),
-            (-90.0, 0.0),
-            (0.0, -90.0),
-            (0.0, 0.0),
-            (0.0, 90.0),
-            (90.0, 0.0),
-            (90.0, 90.0),
-        ]
+        valid_pairs = _allowed_joint_pairs()
         for m in sorted(involved):
             cur_vals = s_q.get(m, [0.0, 0.0])
             for (j1, j2) in valid_pairs:

@@ -13,7 +13,7 @@ def test_valid_joints_zero_flexibility():
 
 def test_invalid_value():
     with pytest.raises(ValidationError):
-        validate_joints({0: [45, 0]}, modules=[0])
+        validate_joints({0: [30, 0]}, modules=[0])
 
 
 def test_invalid_not_opposite():

@@ -103,11 +103,11 @@ def validate_action(s: UBotState, a: Action) -> None:
 def validate_joints(joints: dict[int, list[float]], modules: list[int]) -> None:
     """
     Conventions:
-      - Each module has two hinge joints (j1, j2), degrees in {-90, 0, 90}
+      - Each module has two hinge joints (j1, j2), degrees in {-90, -45, 0, 45, 90}
       - If both are non-zero,要求同号（之前的反号约束取消）
       - If either is zero, the other can be any allowed value
     """
-    allowed = {-90.0, 0.0, 90.0}
+    allowed = {-90.0, -45.0, 0.0, 45.0, 90.0}
     for m in modules:
         if m not in joints:
             raise ValidationError(f"Missing joints for module {m}")
@@ -116,6 +116,6 @@ def validate_joints(joints: dict[int, list[float]], modules: list[int]) -> None:
             raise ValidationError(f"Module {m} joints must have length 2")
         j1, j2 = float(vals[0]), float(vals[1])
         if j1 not in allowed or j2 not in allowed:
-            raise ValidationError(f"Module {m} joints must be in {-90,0,90}, got ({j1},{j2})")
+            raise ValidationError(f"Module {m} joints must be in {-90,-45,0,45,90}, got ({j1},{j2})")
         if j1 != 0.0 and j2 != 0.0 and j1 != j2:
             raise ValidationError(f"Module {m} joints must have same sign when both non-zero, got ({j1},{j2})")
