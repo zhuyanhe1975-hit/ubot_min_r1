@@ -166,6 +166,16 @@ def _edge_between(s: UBotState, u: int, v: int) -> Optional[Tuple[str, str, int]
     return None
 
 
+def _all_edges_between(s: UBotState, u: int, v: int) -> List[Tuple[str, str, int]]:
+    out: List[Tuple[str, str, int]] = []
+    for pu, (vv, pv) in s.adj.get(u, {}).items():
+        if vv != v:
+            continue
+        twist = 0 if s.twist is None else int(s.twist.get((u, pu, v, pv), 0)) % 360
+        out.append((pu, pv, twist))
+    return out
+
+
 def _can_detach_without_isolation(s: UBotState, u: int, v: int) -> bool:
     from ubot.core.graph import clone_state, remove_edge
     from ubot.core.validator import validate_connectivity, ValidationError
@@ -177,6 +187,10 @@ def _can_detach_without_isolation(s: UBotState, u: int, v: int) -> bool:
         return True
     except Exception:
         return False
+
+
+def _neighbors(s: UBotState, u: int) -> List[int]:
+    return sorted({v for _pu, (v, _pv) in s.adj.get(u, {}).items()})
 
 
 def _support_loop_port_switch_seq(
@@ -739,6 +753,465 @@ def plan_hierarchical_edge_swap(
             s2 = _apply_action_pure(s2, a)
         return s2
 
+    def _split_components_if_remove_edge(s: UBotState, u: int, v: int) -> Optional[Tuple[Set[int], Set[int]]]:
+        """
+        Return (comp_u, comp_v) if removing edge u-v disconnects, else None.
+        Components are computed on the undirected graph after removing the single u-v edge.
+        """
+        if u not in s.adj or v not in s.adj:
+            return None
+        # Build neighbor list ignoring u-v
+        def neighbors(x: int):
+            for _px, (y, _py) in s.adj.get(x, {}).items():
+                if (x == u and y == v) or (x == v and y == u):
+                    continue
+                yield y
+
+        seen: Set[int] = set()
+        stack = [u]
+        while stack:
+            x = stack.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            for y in neighbors(x):
+                if y not in seen:
+                    stack.append(y)
+        if v in seen:
+            return None
+        comp_u = seen
+        comp_v = set(s.adj.keys()) - comp_u
+        if not comp_v or not comp_u:
+            return None
+        return (comp_u, comp_v)
+
+    def _support_detach_seq_for_bridge(
+        s: UBotState,
+        u: int,
+        v: int,
+        *,
+        max_port_pairs: int = 4,
+    ) -> Optional[List[Action]]:
+        """
+        Temporary-support macro for a bridge edge u-v that cannot be detached without isolating a component.
+
+        Constructs a short cycle by attaching a support edge from a node in the main component to the
+        subtree endpoint (one of u/v), then detaches the original u-v.
+
+        Hard-limited search:
+          - support node must yield a 4-node path support-...-main-sub (cycle length 4 when support-sub attached)
+          - port pairs limited to `max_port_pairs`
+          - joint search limited by outer args (max_inner_tries/max_inner_solutions)
+        """
+        split = _split_components_if_remove_edge(s, u, v)
+        if split is None:
+            return None
+        comp_u, comp_v = split
+        # choose smaller component as subtree
+        if len(comp_u) <= len(comp_v):
+            sub = u
+            main = v
+            sub_comp = comp_u
+            main_comp = comp_v
+        else:
+            sub = v
+            main = u
+            sub_comp = comp_v
+            main_comp = comp_u
+
+        # If detaching would still keep connectivity (shouldn't happen for bridge), don't use this macro.
+        if _can_detach_without_isolation(s, u, v):
+            return None
+
+        # Candidate support nodes and subtree attachment targets (allow supporting via a leaf in the subtree).
+        # We prefer short paths to keep joint search small.
+        candidates: List[Tuple[int, int, List[int]]] = []
+        for support in sorted(main_comp):
+            if support == main:
+                continue
+            for target in sorted(sub_comp):
+                try:
+                    path_nodes, _ = _find_path_nodes_and_edges(s, support, target)
+                except Exception:
+                    continue
+                # Hard-limit path length to keep inner search cheap; prefer 4-node paths.
+                if len(path_nodes) not in (4, 5):
+                    continue
+                # Ensure the path crosses the bridge (must pass through main and sub).
+                if main not in path_nodes or sub not in path_nodes:
+                    continue
+                # Heuristic: prefer when the penultimate node on the path is the bridge endpoint on main side.
+                if path_nodes[-2] not in (main, sub):
+                    continue
+                candidates.append((support, target, path_nodes))
+
+        if not candidates:
+            return None
+
+        # Deterministic: prefer shorter paths, then smaller support id, then smaller target id.
+        candidates.sort(key=lambda x: (len(x[2]), x[0], x[1]))
+
+        for support, target, path_nodes in candidates[:6]:
+            free_sup = free_ports(s, support)
+            free_tgt = free_ports(s, target)
+            if not free_sup or not free_tgt:
+                continue
+            port_pairs = [(ps, pt) for ps in free_sup for pt in free_tgt]
+            if max_port_pairs > 0:
+                port_pairs = port_pairs[:max_port_pairs]
+
+            for ps, pt in port_pairs:
+                joint_maps = _align_ports_by_path_joints_multi(
+                    s,
+                    support,
+                    ps,
+                    target,
+                    pt,
+                    path_nodes,
+                    max_tries=max_inner_tries,
+                    max_solutions=max_inner_solutions,
+                )
+                if not joint_maps:
+                    continue
+                for jm in joint_maps[:max_inner_solutions]:
+                    joint_actions: List[Action] = []
+                    cur_q = _joints_or_zero(s)
+                    for mid in sorted(jm.keys()):
+                        tgtq = jm[mid]
+                        if cur_q.get(mid, [0.0, 0.0]) != tgtq:
+                            joint_actions.append(
+                                Action(kind="SET_JOINTS", u=mid, v=mid, j1=float(tgtq[0]), j2=float(tgtq[1]))
+                            )
+                    seq = joint_actions + [Action(kind="ATTACH", u=support, v=target, pu=ps, pv=pt)] + [
+                        Action(kind="DETACH", u=u, v=v)
+                    ]
+                    if apply_seq(s, seq) is not None:
+                        return seq
+        return None
+
+    def _support_port_switch_seq_for_bridge(
+        s: UBotState,
+        u: int,
+        v: int,
+        pu_goal: str,
+        pv_goal: str,
+        twist_goal: int,
+        *,
+        max_port_pairs: int = 6,
+    ) -> Optional[List[Action]]:
+        """
+        Switch the u-v connection to (pu_goal,pv_goal,twist_goal) when u-v is a bridge and detaching it would
+        disconnect the v-side component. Uses a short 4-node temporary support loop.
+
+        Template:
+          1) ATTACH(support, ps, v, pv_tmp)   # temporary support edge
+          2) DETACH(u, v)                    # remove old bridge
+          3) ATTACH(u, pu_goal, v, pv_goal)  # attach goal bridge
+          4) DETACH(support, v)              # remove temporary support
+        """
+        split = _split_components_if_remove_edge(s, u, v)
+        if split is None:
+            return None
+        comp_u, comp_v = split
+
+        # Decide which side is the subtree (prefer smaller); ensure `v` is on subtree side.
+        if v in comp_v and u in comp_u:
+            sub_side = comp_v
+            main_side = comp_u
+            main = u
+            sub = v
+        elif v in comp_u and u in comp_v:
+            sub_side = comp_u
+            main_side = comp_v
+            main = u
+            sub = v
+        else:
+            return None
+
+        if len(sub_side) > len(main_side):
+            # swap to keep `sub` on smaller side for support selection
+            main, sub = sub, main
+            main_side, sub_side = sub_side, main_side
+            pu_goal, pv_goal = pv_goal, pu_goal
+
+        if _can_detach_without_isolation(s, u, v):
+            return None
+
+        # Candidate support nodes on main side: shortest path support->sub must have 4 nodes and penultimate is main.
+        candidates: List[Tuple[int, List[int]]] = []
+        for support in sorted(main_side):
+            if support == main:
+                continue
+            try:
+                path_nodes, _ = _find_path_nodes_and_edges(s, support, sub)
+            except Exception:
+                continue
+            if len(path_nodes) != 4:
+                continue
+            if path_nodes[-2] != main:
+                continue
+            candidates.append((support, path_nodes))
+        if not candidates:
+            return None
+
+        # Port preferences: try E/W on support first; avoid consuming pv_goal on `sub` if possible.
+        sup_pref = {"E": 0, "W": 1, "N": 2, "S": 3}
+        sub_pref = {pv_goal: 9, "E": 0, "W": 1, "N": 2, "S": 3}
+
+        for support, path_nodes in candidates[:3]:
+            free_sup = free_ports(s, support)
+            free_sub = free_ports(s, sub)
+            if not free_sup or not free_sub:
+                continue
+            port_pairs = [(ps, pv_tmp) for ps in free_sup for pv_tmp in free_sub]
+            port_pairs.sort(key=lambda pp: (sup_pref.get(pp[0], 9), sub_pref.get(pp[1], 9), pp[0], pp[1]))
+            if max_port_pairs > 0:
+                port_pairs = port_pairs[:max_port_pairs]
+
+            for ps, pv_tmp in port_pairs:
+                # Align and attach temporary support edge support.ps -- sub.pv_tmp
+                jm_list = _align_ports_by_path_joints_multi(
+                    s,
+                    support,
+                    ps,
+                    sub,
+                    pv_tmp,
+                    path_nodes,
+                    max_tries=max_inner_tries,
+                    max_solutions=max_inner_solutions,
+                )
+                if not jm_list:
+                    continue
+                for jm in jm_list[:max_inner_solutions]:
+                    joint_actions: List[Action] = []
+                    cur_q = _joints_or_zero(s)
+                    for mid in sorted(jm.keys()):
+                        tgt = jm[mid]
+                        if cur_q.get(mid, [0.0, 0.0]) != tgt:
+                            joint_actions.append(
+                                Action(kind="SET_JOINTS", u=mid, v=mid, j1=float(tgt[0]), j2=float(tgt[1]))
+                            )
+                    seq_a = joint_actions + [Action(kind="ATTACH", u=support, v=sub, pu=ps, pv=pv_tmp)]
+                    s_a = apply_seq(s, seq_a)
+                    if s_a is None:
+                        continue
+
+                    # Detach old bridge
+                    s_b = apply_seq(s_a, [Action(kind="DETACH", u=u, v=v)])
+                    if s_b is None:
+                        continue
+
+                    # Align and attach the goal bridge main.pu_goal -- sub.pv_goal, then remove temp support.
+                    try:
+                        path2, _ = _find_path_nodes_and_edges(s_b, main, sub)
+                    except Exception:
+                        continue
+                    jm2_list = _align_ports_by_path_joints_multi(
+                        s_b,
+                        main,
+                        pu_goal,
+                        sub,
+                        pv_goal,
+                        path2,
+                        max_tries=max_inner_tries,
+                        max_solutions=max_inner_solutions,
+                    )
+                    if not jm2_list:
+                        continue
+                    for jm2 in jm2_list[:max_inner_solutions]:
+                        joint_actions2: List[Action] = []
+                        cur_q2 = _joints_or_zero(s_b)
+                        for mid in sorted(jm2.keys()):
+                            tgt = jm2[mid]
+                            if cur_q2.get(mid, [0.0, 0.0]) != tgt:
+                                joint_actions2.append(
+                                    Action(kind="SET_JOINTS", u=mid, v=mid, j1=float(tgt[0]), j2=float(tgt[1]))
+                                )
+                        seq_c = joint_actions2 + [
+                            Action(
+                                kind="ATTACH",
+                                u=main,
+                                v=sub,
+                                pu=pu_goal,
+                                pv=pv_goal,
+                                twist=int(twist_goal) % 360,
+                            ),
+                            Action(kind="DETACH", u=support, v=sub),
+                        ]
+                        if apply_seq(s_b, seq_c) is not None:
+                            return seq_a + [Action(kind="DETACH", u=u, v=v)] + seq_c
+
+        return None
+
+    def _relocate_bridge_with_supports(
+        s: UBotState,
+        *,
+        new_main: int,
+        subroot: int,
+        pu_goal: str,
+        pv_goal: str,
+        twist_goal: int,
+    ) -> Optional[List[Action]]:
+        """
+        Relocate a subtree rooted at `subroot` from its current main-side bridge to a new main node.
+
+        This is a tightly-scoped macro intended to cover cases like demo7 T->line:
+          - `subroot` has exactly one bridge edge to the main component (call it old_main)
+          - we can temporarily support the subtree via `new_main--subroot` (support1) and `old_main--subroot` (support2)
+          - then replace support1 with the goal edge (new_main,pu_goal)-(subroot,pv_goal,twist_goal)
+
+        The macro searches a small number of port-pair options and uses the existing path joint aligner.
+        """
+        if new_main == subroot:
+            return None
+        if pu_goal in s.adj.get(new_main, {}) or pv_goal in s.adj.get(subroot, {}):
+            # Goal ports already occupied; relocation not applicable in this state.
+            return None
+
+        # Identify old_main as a neighbor of subroot such that removing old_main-subroot disconnects the graph.
+        old_main = None
+        for nb in _neighbors(s, subroot):
+            if _split_components_if_remove_edge(s, nb, subroot) is not None:
+                old_main = nb
+                break
+        if old_main is None:
+            return None
+        if old_main == new_main:
+            return None
+
+        # Support1: attach new_main to subroot using free ports (not necessarily the goal ports).
+        free_new = free_ports(s, new_main)
+        free_sub = free_ports(s, subroot)
+        if not free_new or not free_sub:
+            return None
+        # Try up to 6 support1 port pairs, prefer using the eventual goal ports if free.
+        support1_pairs = [(pu_goal, pv_goal)] if (pu_goal in free_new and pv_goal in free_sub) else []
+        for pu in free_new:
+            for pv in free_sub:
+                if (pu, pv) not in support1_pairs:
+                    support1_pairs.append((pu, pv))
+        support1_pairs = support1_pairs[:6]
+
+        for sup1_pu, sup1_pv in support1_pairs:
+            # Align and attach support1 along the current path between new_main and subroot.
+            try:
+                path1, _ = _find_path_nodes_and_edges(s, new_main, subroot)
+            except Exception:
+                continue
+            jm1_list = _align_ports_by_path_joints_multi(
+                s,
+                new_main,
+                sup1_pu,
+                subroot,
+                sup1_pv,
+                path1,
+                max_tries=max_inner_tries,
+                max_solutions=max_inner_solutions,
+            )
+            if not jm1_list:
+                continue
+
+            for jm1 in jm1_list[:max_inner_solutions]:
+                joint_actions1: List[Action] = []
+                cur_q = _joints_or_zero(s)
+                for mid in sorted(jm1.keys()):
+                    tgt = jm1[mid]
+                    if cur_q.get(mid, [0.0, 0.0]) != tgt:
+                        joint_actions1.append(Action(kind="SET_JOINTS", u=mid, v=mid, j1=float(tgt[0]), j2=float(tgt[1])))
+
+                seq_a = joint_actions1 + [Action(kind="ATTACH", u=new_main, v=subroot, pu=sup1_pu, pv=sup1_pv)]
+                s_a = apply_seq(s, seq_a)
+                if s_a is None:
+                    continue
+
+                # Detach old bridge (subtree stays supported by support1).
+                s_b = apply_seq(s_a, [Action(kind="DETACH", u=old_main, v=subroot)])
+                if s_b is None:
+                    continue
+
+                # Support2: attach old_main to subroot (to keep subtree connected while we reattach goal on new_main).
+                free_old = free_ports(s_b, old_main)
+                free_sub2 = free_ports(s_b, subroot)
+                if not free_old or not free_sub2:
+                    continue
+                support2_pairs: List[Tuple[str, str]] = []
+                for pu in free_old:
+                    for pv in free_sub2:
+                        support2_pairs.append((pu, pv))
+                support2_pairs = support2_pairs[:6]
+
+                for sup2_pu, sup2_pv in support2_pairs:
+                    try:
+                        path2, _ = _find_path_nodes_and_edges(s_b, old_main, subroot)
+                    except Exception:
+                        continue
+                    jm2_list = _align_ports_by_path_joints_multi(
+                        s_b,
+                        old_main,
+                        sup2_pu,
+                        subroot,
+                        sup2_pv,
+                        path2,
+                        max_tries=max_inner_tries,
+                        max_solutions=max_inner_solutions,
+                    )
+                    if not jm2_list:
+                        continue
+                    for jm2 in jm2_list[:max_inner_solutions]:
+                        joint_actions2: List[Action] = []
+                        cur_q2 = _joints_or_zero(s_b)
+                        for mid in sorted(jm2.keys()):
+                            tgt = jm2[mid]
+                            if cur_q2.get(mid, [0.0, 0.0]) != tgt:
+                                joint_actions2.append(
+                                    Action(kind="SET_JOINTS", u=mid, v=mid, j1=float(tgt[0]), j2=float(tgt[1]))
+                                )
+                        seq_b = joint_actions2 + [Action(kind="ATTACH", u=old_main, v=subroot, pu=sup2_pu, pv=sup2_pv)]
+                        s_c = apply_seq(s_b, seq_b)
+                        if s_c is None:
+                            continue
+
+                        # Remove support1 (now supported via support2).
+                        s_d = apply_seq(s_c, [Action(kind="DETACH", u=new_main, v=subroot)])
+                        if s_d is None:
+                            continue
+
+                        # Finally, align and attach the goal edge new_main.pu_goal -- subroot.pv_goal with twist_goal.
+                        try:
+                            path_goal, _ = _find_path_nodes_and_edges(s_d, new_main, subroot)
+                        except Exception:
+                            continue
+                        jm_goal_list = _align_ports_by_path_joints_multi(
+                            s_d,
+                            new_main,
+                            pu_goal,
+                            subroot,
+                            pv_goal,
+                            path_goal,
+                            max_tries=max_inner_tries,
+                            max_solutions=max_inner_solutions,
+                        )
+                        if not jm_goal_list:
+                            continue
+                        for jm_goal in jm_goal_list[:max_inner_solutions]:
+                            joint_actions3: List[Action] = []
+                            cur_q3 = _joints_or_zero(s_d)
+                            for mid in sorted(jm_goal.keys()):
+                                tgt = jm_goal[mid]
+                                if cur_q3.get(mid, [0.0, 0.0]) != tgt:
+                                    joint_actions3.append(
+                                        Action(kind="SET_JOINTS", u=mid, v=mid, j1=float(tgt[0]), j2=float(tgt[1]))
+                                    )
+                            seq_c = joint_actions3 + [
+                                Action(kind="ATTACH", u=new_main, v=subroot, pu=pu_goal, pv=pv_goal, twist=int(twist_goal) % 360),
+                                Action(kind="DETACH", u=old_main, v=subroot),
+                            ]
+                            if apply_seq(s_d, seq_c) is None:
+                                continue
+                            return seq_a + [Action(kind="DETACH", u=old_main, v=subroot)] + seq_b + [Action(kind="DETACH", u=new_main, v=subroot)] + seq_c
+
+        return None
+
     def fix_joints_seq(s: UBotState) -> Optional[List[Action]]:
         cur_q = _joints_or_zero(s)
         seq: List[Action] = []
@@ -841,6 +1314,29 @@ def plan_hierarchical_edge_swap(
 
         cur_edges = cur_edges_now
         missing = sorted(goal_edges - cur_edges)
+        extra = sorted(cur_edges - goal_edges)
+
+        # If there are extra edges, try removing them first. If removal would isolate a subtree, try
+        # a tightly-scoped temporary-support macro (4-node cycle) to enable the detach.
+        if extra:
+            for (uu, vv, _pu, _pv, _tw) in extra[:4]:
+                # direct detach
+                seq = [Action(kind="DETACH", u=uu, v=vv)]
+                s2 = apply_seq(s, seq)
+                if s2 is None:
+                    # bridge support macro
+                    seq = _support_detach_seq_for_bridge(s, uu, vv)
+                    if seq is None:
+                        continue
+                    s2 = apply_seq(s, seq)
+                if s2 is None:
+                    continue
+                sig2 = state_sig(s2)
+                g2 = g_cost + len(seq)
+                if g2 >= best_g.get(sig2, 10**9):
+                    continue
+                best_g[sig2] = g2
+                heappush(pq, (g2 + h(s2), g2, next(counter), (s2, path + seq)))
 
         # If topology matches, only fix joints.
         if not missing:
@@ -862,6 +1358,53 @@ def plan_hierarchical_edge_swap(
 
         # Topology step: try edge-swap moves toward missing goal edges.
         for (u, v, pu_goal, pv_goal, twist_goal) in missing:
+            # Macro: relocate a bridge-attached subtree root to a new main node using two temporary supports.
+            # This targets cases like demo7 T->line where an extra bridge edge must be removed and a new
+            # bridge edge to the same subroot must be created.
+            if not ignore_ports:
+                seq = _relocate_bridge_with_supports(
+                    s,
+                    new_main=u,
+                    subroot=v,
+                    pu_goal=pu_goal,
+                    pv_goal=pv_goal,
+                    twist_goal=int(twist_goal) % 360,
+                )
+                if seq is not None:
+                    s2 = apply_seq(s, seq)
+                    if s2 is not None:
+                        sig2 = state_sig(s2)
+                        g2 = g_cost + len(seq)
+                        if g2 < best_g.get(sig2, 10**9):
+                            best_g[sig2] = g2
+                            heappush(pq, (g2 + h(s2), g2, next(counter), (s2, path + seq)))
+
+            # If u-v are already connected by exactly one undirected edge but with different ports/twist,
+            # prefer a temporary-support "bridge port-switch" macro (avoid parallel edges between same modules).
+            if not ignore_ports:
+                cur_uv = _all_edges_between(s, u, v)
+                cur_vu = _all_edges_between(s, v, u)
+                if (len(cur_uv) + len(cur_vu)) == 2:
+                    cur = cur_uv[0] if cur_uv else cur_vu[0]
+                    cur_pu, cur_pv, cur_tw = cur
+                    if (cur_pu, cur_pv, int(cur_tw) % 360) != (pu_goal, pv_goal, int(twist_goal) % 360):
+                        seq = _support_port_switch_seq_for_bridge(
+                            s,
+                            u,
+                            v,
+                            pu_goal,
+                            pv_goal,
+                            int(twist_goal) % 360,
+                        )
+                        if seq is not None:
+                            s2 = apply_seq(s, seq)
+                            if s2 is not None:
+                                sig2 = state_sig(s2)
+                                g2 = g_cost + len(seq)
+                                if g2 < best_g.get(sig2, 10**9):
+                                    best_g[sig2] = g2
+                                    heappush(pq, (g2 + h(s2), g2, next(counter), (s2, path + seq)))
+
             # Special case: u-v already directly connected but with different ports (a "port switch").
             # If detaching would isolate a leaf, try a 4-module temporary-support loop template.
             cur_uv = _edge_between(s, u, v)
