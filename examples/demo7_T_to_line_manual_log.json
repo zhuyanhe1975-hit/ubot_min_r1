@@ -1,0 +1,48 @@
+{
+  "meta": {
+    "name": "demo7 T->line manual",
+    "note": "Action sequence expanded from user step1-step11; each SET_JOINTS targets one module.",
+    "start": "examples/demo7_T_to_line_start.json",
+    "goal": "examples/demo7_T_to_line_goal.json"
+  },
+  "plan": [
+    { "kind": "SET_JOINTS", "u": 1, "v": 1, "j1": 90, "j2": 0 },
+    { "kind": "SET_JOINTS", "u": 2, "v": 2, "j1": -90, "j2": 0 },
+    { "kind": "SET_JOINTS", "u": 5, "v": 5, "j1": 90, "j2": 0 },
+
+    { "kind": "SET_JOINTS", "u": 3, "v": 3, "j1": 0, "j2": -90 },
+    { "kind": "SET_JOINTS", "u": 4, "v": 4, "j1": 0, "j2": 90 },
+
+    { "kind": "ATTACH", "u": 4, "v": 5, "pu": "E", "pv": "W", "twist": 0 },
+    { "kind": "DETACH", "u": 2, "v": 5 },
+
+    { "kind": "SET_JOINTS", "u": 4, "v": 4, "j1": 0, "j2": 0 },
+    { "kind": "SET_JOINTS", "u": 5, "v": 5, "j1": 0, "j2": -90 },
+
+    { "kind": "SET_JOINTS", "u": 4, "v": 4, "j1": 0, "j2": 90 },
+
+    { "kind": "ATTACH", "u": 2, "v": 5, "pu": "N", "pv": "E", "twist": 90 },
+    { "kind": "DETACH", "u": 4, "v": 5 },
+
+    { "kind": "SET_JOINTS", "u": 5, "v": 5, "j1": -90, "j2": -90 },
+    { "kind": "SET_JOINTS", "u": 6, "v": 6, "j1": -90, "j2": 0 },
+
+    { "kind": "ATTACH", "u": 1, "v": 6, "pu": "S", "pv": "N", "twist": 90 },
+    { "kind": "DETACH", "u": 2, "v": 5 },
+
+    { "kind": "SET_JOINTS", "u": 4, "v": 4, "j1": 90, "j2": 90 },
+    { "kind": "SET_JOINTS", "u": 5, "v": 5, "j1": 0, "j2": 90 },
+
+    { "kind": "ATTACH", "u": 4, "v": 5, "pu": "E", "pv": "S", "twist": 180 },
+    { "kind": "DETACH", "u": 1, "v": 6 },
+
+    { "kind": "SET_JOINTS", "u": 1, "v": 1, "j1": 0, "j2": 0 },
+    { "kind": "SET_JOINTS", "u": 2, "v": 2, "j1": 0, "j2": 0 },
+    { "kind": "SET_JOINTS", "u": 3, "v": 3, "j1": 0, "j2": 0 },
+    { "kind": "SET_JOINTS", "u": 4, "v": 4, "j1": 0, "j2": 0 },
+    { "kind": "SET_JOINTS", "u": 5, "v": 5, "j1": 0, "j2": 0 },
+    { "kind": "SET_JOINTS", "u": 6, "v": 6, "j1": 0, "j2": 0 }
+  ],
+  "executed": []
+}
+

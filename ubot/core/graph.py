@@ -17,6 +17,10 @@ def add_edge(s: UBotState, e: Edge) -> None:
         raise GraphError(f"Port occupied: {e.v}.{e.pv}")
     s.adj.setdefault(e.u, {})[e.pu] = (e.v, e.pv)
     s.adj.setdefault(e.v, {})[e.pv] = (e.u, e.pu)
+    if s.twist is None:
+        s.twist = {}
+    s.twist[(e.u, e.pu, e.v, e.pv)] = int(e.twist) % 360
+    s.twist[(e.v, e.pv, e.u, e.pu)] = int(e.twist) % 360
 
 def remove_edge(s: UBotState, u: int, v: int) -> None:
     ports_u = list(s.adj.get(u, {}).items())
@@ -25,6 +29,9 @@ def remove_edge(s: UBotState, u: int, v: int) -> None:
             del s.adj[u][pu]
             if pv in s.adj.get(v, {}) and s.adj[v][pv][0] == u:
                 del s.adj[v][pv]
+            if s.twist is not None:
+                s.twist.pop((u, pu, v, pv), None)
+                s.twist.pop((v, pv, u, pu), None)
             return
     raise GraphError(f"No edge between {u} and {v}")
 
@@ -35,12 +42,15 @@ def edges_undirected(s: UBotState) -> List[Edge]:
         for pu, (v, pv) in ports.items():
             if (u, v, pu, pv) in seen or (v, u, pv, pu) in seen:
                 continue
+            twist = 0
+            if s.twist is not None:
+                twist = int(s.twist.get((u, pu, v, pv), 0)) % 360
             if u < v:
-                out.append(Edge(u=u, v=v, pu=pu, pv=pv))
+                out.append(Edge(u=u, v=v, pu=pu, pv=pv, twist=twist))
                 seen.add((u, v, pu, pv))
                 seen.add((v, u, pv, pu))
             else:
-                out.append(Edge(u=v, v=u, pu=pv, pv=pu))
+                out.append(Edge(u=v, v=u, pu=pv, pv=pu, twist=twist))
                 seen.add((v, u, pv, pu))
                 seen.add((u, v, pu, pv))
     out.sort(key=lambda e: (e.u, e.v, e.pu, e.pv))
@@ -55,9 +65,9 @@ def clone_state(s: UBotState) -> UBotState:
         pose=None
         if s.pose is None
         else {mid: tuple(float(v) for v in vals) for mid, vals in s.pose.items()},
-        weld=None
-        if s.weld is None
-        else {(int(u), str(pu), int(v), str(pv)): tuple(float(x) for x in tf) for (u, pu, v, pv), tf in s.weld.items()},
+        twist=None
+        if s.twist is None
+        else {(int(u), str(pu), int(v), str(pv)): int(t) for (u, pu, v, pv), t in s.twist.items()},
     )
 
 

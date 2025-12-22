@@ -17,7 +17,8 @@ def test_planner_example():
     goal = empty_state([0, 1], ["N", "S", "E", "W"])
     goal.q = {0: [0.0, 0.0], 1: [0.0, 0.0]}
     goal.pose = dict(s.pose)
-    add_edge(goal, Edge(0, 1, "E", "W"))
+    # For these connector frames, the aligned identity/identity pose implies twist=180.
+    add_edge(goal, Edge(0, 1, "E", "W", twist=180))
     plan = plan_astar(s, goal, max_expand=2000)
     assert plan is not None
     assert any(a.kind == "ATTACH" for a in plan)

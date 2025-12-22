@@ -5,9 +5,12 @@ import os
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+import threading
+import queue
 
 from ubot.core.io import load_state_json
 from ubot.core.graph import edges_undirected
+from ubot.core.graph import compute_parent_map
 from ubot.core.layout import layout_from_ports
 from ubot.core.types import Action
 from ubot.adapters.sim_adapter import SimAdapter
@@ -39,6 +42,13 @@ def main() -> None:
     ap.add_argument("--log", default=None, help="Optional plan log JSON to replay (needs matching start state)")
     ap.add_argument("--step_dt", type=float, default=1.0, help="Seconds to hold each step when replaying a log")
     ap.add_argument("--interp_steps", type=int, default=15, help="Frames for interpolating SET_JOINTS actions (>=1)")
+    ap.add_argument("--interactive", action="store_true", help="Interactive mode: read SET_JOINTS/ATTACH/DETACH from stdin")
+    ap.add_argument(
+        "--watch_state",
+        type=float,
+        default=None,
+        help="Poll interval (sec) to hot-reload --state JSON and update the viewer (no restart).",
+    )
     ap.add_argument(
         "--graph_out",
         default=None,
@@ -234,6 +244,51 @@ def main() -> None:
     if args.no_viewer:
         return
 
+    # Hot-reload support: re-load the state JSON and update adapter/model in-place.
+    state_mtime = None
+    next_watch_time = 0.0
+    if args.watch_state is not None:
+        if args.watch_state <= 0:
+            raise SystemExit("--watch_state must be > 0")
+        try:
+            state_mtime = os.path.getmtime(args.state)
+        except OSError:
+            state_mtime = None
+
+    def _hot_reload_state_if_changed(now: float) -> None:
+        nonlocal state_mtime, next_watch_time
+        if args.watch_state is None:
+            return
+        if now < next_watch_time:
+            return
+        next_watch_time = now + float(args.watch_state)
+        try:
+            mtime = os.path.getmtime(args.state)
+        except OSError:
+            return
+        if state_mtime is not None and mtime == state_mtime:
+            return
+        state_mtime = mtime
+        try:
+            s_new = load_state_json(args.state)
+        except Exception as e:
+            print(f"[watch] reload failed: {e}")
+            return
+        new_modules = list(s_new.adj.keys())
+        if set(new_modules) != set(modules) or len(new_modules) != len(modules):
+            print(f"[watch] module set changed; ignoring reload. old={modules}, new={new_modules}")
+            return
+        # Keep the original module ordering for mapping to replicated bodies.
+        try:
+            adapter._state = s_new  # type: ignore[attr-defined]
+            adapter._state.parent = compute_parent_map(adapter._state, root=0)  # type: ignore[attr-defined]
+            adapter._update_poses()  # type: ignore[attr-defined]
+        except Exception as e:
+            print(f"[watch] failed to apply reloaded state: {e}")
+            return
+        _apply_pose_to_model(adapter.get_state())
+        print("[watch] reloaded state.")
+
     # If log is provided, replay actions sequentially
     actions = []
     if args.log:
@@ -249,17 +304,128 @@ def main() -> None:
                     v=a["v"],
                     pu=a.get("pu"),
                     pv=a.get("pv"),
+                    twist=a.get("twist"),
                     j1=a.get("j1"),
                     j2=a.get("j2"),
                 )
             )
         print(f"[replay] loaded {len(actions)} actions from log.")
 
+    def _parse_command(line: str) -> Action | None:
+        """
+        Supported commands (whitespace separated, case-insensitive):
+          - SET_JOINTS <module> <j1_deg> <j2_deg>
+          - ATTACH <u> <pu> <v> <pv> [twist_deg]
+          - DETACH <u> <v>
+          - PRINT   (prints current edges+joints)
+          - HELP
+          - QUIT / EXIT
+        """
+        s = line.strip()
+        if not s:
+            return None
+        parts = s.replace(",", " ").replace("(", " ").replace(")", " ").split()
+        if not parts:
+            return None
+        cmd = parts[0].upper()
+        if cmd in ("HELP", "?"):
+            print(
+                "[interactive] commands:\n"
+                "  SET_JOINTS <m> <j1> <j2>\n"
+                "  ATTACH <u> <pu> <v> <pv> [twist]\n"
+                "  DETACH <u> <v>\n"
+                "  PRINT\n"
+                "  QUIT"
+            )
+            return None
+        if cmd in ("QUIT", "EXIT"):
+            return Action(kind="DETACH", u=-1, v=-1)  # sentinel
+        if cmd == "PRINT":
+            st = adapter.get_state()
+            print("[interactive] edges:", [e.__dict__ for e in edges_undirected(st)])
+            print("[interactive] joints:", st.q)
+            return None
+        if cmd in ("SET_JOINT", "SET_JOINTS"):
+            if len(parts) != 4:
+                print("[interactive] usage: SET_JOINTS <m> <j1> <j2>")
+                return None
+            m = int(parts[1])
+            j1 = float(parts[2])
+            j2 = float(parts[3])
+            return Action(kind="SET_JOINTS", u=m, v=m, j1=j1, j2=j2)
+        if cmd == "DETACH":
+            if len(parts) != 3:
+                print("[interactive] usage: DETACH <u> <v>")
+                return None
+            u = int(parts[1])
+            v = int(parts[2])
+            return Action(kind="DETACH", u=u, v=v)
+        if cmd == "ATTACH":
+            if len(parts) not in (5, 6):
+                print("[interactive] usage: ATTACH <u> <pu> <v> <pv> [twist]")
+                return None
+            u = int(parts[1])
+            pu = parts[2].upper()
+            v = int(parts[3])
+            pv = parts[4].upper()
+            twist = None
+            if len(parts) == 6:
+                twist = int(float(parts[5])) % 360
+            return Action(kind="ATTACH", u=u, v=v, pu=pu, pv=pv, twist=twist)
+        print(f"[interactive] unknown command: {cmd}. Type HELP.")
+        return None
+
+    cmd_q: queue.Queue[Action] = queue.Queue()
+
+    def _stdin_reader() -> None:
+        print("[interactive] ready. Type HELP for commands.")
+        while True:
+            try:
+                line = input("> ")
+            except EOFError:
+                cmd_q.put(Action(kind="DETACH", u=-1, v=-1))  # sentinel
+                return
+            try:
+                a = _parse_command(line)
+            except Exception as e:
+                print(f"[interactive] parse error: {e}")
+                continue
+            if a is None:
+                continue
+            cmd_q.put(a)
+            if a.kind == "DETACH" and a.u == -1 and a.v == -1:
+                return
+
     with mujoco.viewer.launch_passive(model, data) as viewer:  # pragma: no cover
         step_idx = 0
         next_time = time.time()
+        if args.interactive:
+            t = threading.Thread(target=_stdin_reader, daemon=True)
+            t.start()
         while viewer.is_running():
             now = time.time()
+            _hot_reload_state_if_changed(now)
+
+            # Process interactive command queue (highest priority).
+            if args.interactive:
+                try:
+                    a = cmd_q.get_nowait()
+                except queue.Empty:
+                    a = None
+                if a is not None:
+                    if a.kind == "DETACH" and a.u == -1 and a.v == -1:
+                        print("[interactive] exiting viewer loop.")
+                        break
+                    try:
+                        adapter.apply(a)
+                        _apply_pose_to_model(adapter.get_state())
+                        viewer.sync()
+                        hold = 0.5 if a.kind in ("ATTACH", "DETACH") else args.step_dt
+                        time.sleep(max(0.01, hold))
+                    except Exception as e:
+                        print(f"[interactive] action rejected: {e}")
+                    continue
+
             if step_idx < len(actions) and now >= next_time:
                 a = actions[step_idx]
                 # snapshot connected set before action (for attach interpolation)

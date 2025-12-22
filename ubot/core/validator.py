@@ -50,11 +50,6 @@ def validate_action(s: UBotState, a: Action) -> None:
         from ubot.core.graph import clone_state, remove_edge
 
         s2 = clone_state(s)
-        if s2.weld is not None:
-            for pu, (vv, pv) in list(s2.adj.get(a.u, {}).items()):
-                if vv == a.v:
-                    s2.weld.pop((a.u, pu, a.v, pv), None)
-                    s2.weld.pop((a.v, pv, a.u, pu), None)
         remove_edge(s2, a.u, a.v)
         validate_connectivity(s2)
     elif a.kind == "ATTACH":
@@ -71,10 +66,17 @@ def validate_action(s: UBotState, a: Action) -> None:
         # Geometric constraint: ports must already be aligned in world (no teleport).
         if s.pose is None:
             raise ValidationError("Missing state pose; cannot validate geometric ATTACH.")
-        from ubot.core.kinematics import ports_aligned
+        from ubot.core.kinematics import ports_aligned, compute_twist_from_pose
 
         if not ports_aligned(s, s.pose, a.u, a.pu, a.v, a.pv):
             raise ValidationError("Ports not aligned in world for ATTACH.")
+        # Twist must be representable in our discrete model.
+        try:
+            twist = compute_twist_from_pose(s, s.pose, a.u, a.pu, a.v, a.pv)
+        except Exception as e:
+            raise ValidationError(f"ATTACH twist not representable: {e}") from e
+        if a.twist is not None and int(a.twist) % 360 != int(twist) % 360:
+            raise ValidationError(f"ATTACH twist mismatch: requested {a.twist}, computed {twist}.")
     elif a.kind == "SET_JOINTS":
         if a.j1 is None or a.j2 is None:
             raise ValidationError("SET_JOINTS requires j1/j2.")

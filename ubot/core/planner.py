@@ -11,10 +11,9 @@ from ubot.core.kinematics import (
     solve_from_anchor,
     tf_to_pose_tuple,
     Transform,
-    ensure_welds_from_pose,
-    compute_weld_from_pose,
-    tf_inv,
+    compute_twist_from_pose,
     tf_mul,
+    tf_inv,
     port_tf_in_ax,
     weld_tf,
 )
@@ -24,26 +23,16 @@ def _joints_or_zero(s: UBotState) -> Dict[int, List[float]]:
         return {}
     return s.q
 
-def _edge_sig(s: UBotState) -> Tuple[Tuple[int, int, str, str], ...]:
-    return tuple((e.u, e.v, e.pu, e.pv) for e in edges_undirected(s))
+def _edge_sig(s: UBotState) -> Tuple[Tuple[int, int, str, str, int], ...]:
+    return tuple((e.u, e.v, e.pu, e.pv, int(e.twist) % 360) for e in edges_undirected(s))
 
 
-def state_sig(s: UBotState) -> Tuple[Tuple[int, int, str, str], ...]:
+def state_sig(s: UBotState) -> Tuple[Tuple, ...]:
     edges_sig = _edge_sig(s)
     joints_sig = tuple((m, float(v[0]), float(v[1])) for m, v in sorted(_joints_or_zero(s).items()))
-    pose_sig: Tuple[Tuple, ...] = ()
-    if s.pose is not None:
-        # round poses to keep hashing stable
-        pose_sig = tuple((m,) + tuple(round(float(x), 6) for x in s.pose[m]) for m in sorted(s.pose.keys()))
-    weld_sig: Tuple[Tuple, ...] = ()
-    if s.weld is not None:
-        weld_sig = tuple(
-            (u, pu, v, pv) + tuple(round(float(x), 6) for x in tf)
-            for (u, pu, v, pv), tf in sorted(s.weld.items())
-        )
-    return edges_sig + joints_sig + pose_sig + weld_sig
+    return edges_sig + joints_sig
 
-def edge_set(s: UBotState) -> Set[Tuple[int, int, str, str]]:
+def edge_set(s: UBotState) -> Set[Tuple[int, int, str, str, int]]:
     return set(_edge_sig(s))
 
 def heuristic(s: UBotState, goal: UBotState) -> int:
@@ -56,19 +45,12 @@ def heuristic(s: UBotState, goal: UBotState) -> int:
 def _apply_action_pure(s: UBotState, a: Action) -> UBotState:
     s2 = clone_state(s)
     if a.kind == "DETACH":
-        if s2.weld is not None:
-            for pu, (vv, pv) in list(s2.adj.get(a.u, {}).items()):
-                if vv == a.v:
-                    s2.weld.pop((a.u, pu, a.v, pv), None)
-                    s2.weld.pop((a.v, pv, a.u, pu), None)
         remove_edge(s2, a.u, a.v)
     elif a.kind == "ATTACH":
-        if s2.pose is not None:
-            ensure_welds_from_pose(s2, s2.pose)
-            X = compute_weld_from_pose(s2, s2.pose, a.u, a.pu, a.v, a.pv)
-            s2.weld[(a.u, a.pu, a.v, a.pv)] = tf_to_pose_tuple(X)
-            s2.weld[(a.v, a.pv, a.u, a.pu)] = tf_to_pose_tuple(tf_inv(X))
-        add_edge(s2, Edge(u=a.u, v=a.v, pu=a.pu, pv=a.pv))
+        twist = int(a.twist) % 360 if a.twist is not None else None
+        if twist is None and s2.pose is not None:
+            twist = compute_twist_from_pose(s2, s2.pose, a.u, a.pu, a.v, a.pv)
+        add_edge(s2, Edge(u=a.u, v=a.v, pu=a.pu, pv=a.pv, twist=int(twist or 0)))
     else:  # SET_JOINTS
         if s2.q is None:
             s2.q = {}
@@ -156,17 +138,180 @@ def _find_path_nodes_and_edges(s: UBotState, u: int, v: int) -> Tuple[List[int],
     edges: List[Edge] = []
     for a, b in zip(nodes[:-1], nodes[1:]):
         pu = pv = None
+        twist = 0
         for p_a, (bb, p_b) in s.adj.get(a, {}).items():
             if bb == b:
                 pu, pv = p_a, p_b
+                if s.twist is not None:
+                    twist = int(s.twist.get((a, pu, b, pv), 0)) % 360
                 break
         if pu is None or pv is None:
             raise ValueError("Broken adjacency while reconstructing path.")
         if a < b:
-            edges.append(Edge(u=a, v=b, pu=pu, pv=pv))
+            edges.append(Edge(u=a, v=b, pu=pu, pv=pv, twist=twist))
         else:
-            edges.append(Edge(u=b, v=a, pu=pv, pv=pu))
+            edges.append(Edge(u=b, v=a, pu=pv, pv=pu, twist=twist))
     return nodes, edges
+
+
+def _edge_between(s: UBotState, u: int, v: int) -> Optional[Tuple[str, str, int]]:
+    """
+    If u and v are directly connected, return (pu_on_u, pv_on_v, twist_deg) for the directed u->v.
+    """
+    for pu, (vv, pv) in s.adj.get(u, {}).items():
+        if vv != v:
+            continue
+        twist = 0 if s.twist is None else int(s.twist.get((u, pu, v, pv), 0)) % 360
+        return (pu, pv, twist)
+    return None
+
+
+def _can_detach_without_isolation(s: UBotState, u: int, v: int) -> bool:
+    from ubot.core.graph import clone_state, remove_edge
+    from ubot.core.validator import validate_connectivity, ValidationError
+
+    s2 = clone_state(s)
+    try:
+        remove_edge(s2, u, v)
+        validate_connectivity(s2)
+        return True
+    except Exception:
+        return False
+
+
+def _support_loop_port_switch_seq(
+    s: UBotState,
+    *,
+    leaf: int,
+    parent: int,
+    goal_pu: str,
+    goal_pv: str,
+    goal_twist: int,
+    max_inner_tries: int,
+    max_inner_solutions: int,
+    apply_seq_fn,
+) -> Optional[List[Action]]:
+    """
+    Try a 4-module temporary-support template to switch the leaf-parent connection ports.
+
+    Precondition:
+      - `leaf` is degree-1 and connected to `parent`.
+      - Direct DETACH(leaf,parent) is not allowed (would isolate leaf).
+
+    Template (cycle length 4):
+      1) pick support node `s3` at distance 3 from leaf along the unique path: leaf-parent-n2-s3
+      2) align and ATTACH(s3, ps, leaf, pl) as temporary support (ps/pl are free ports)
+      3) DETACH(parent, leaf) (now allowed)
+      4) align and ATTACH(parent, goal_pu, leaf, goal_pv, twist=goal_twist)
+      5) DETACH(s3, leaf) to remove temporary support
+    """
+    # Find the 4-node chain leaf -> parent -> n2 -> s3
+    path_to_root, _ = _find_path_nodes_and_edges(s, 0, leaf)  # root..leaf
+    if len(path_to_root) < 4:
+        return None
+    # last nodes are ... s3, n2, parent, leaf
+    s3, n2, parent2, leaf2 = path_to_root[-4], path_to_root[-3], path_to_root[-2], path_to_root[-1]
+    if leaf2 != leaf or parent2 != parent:
+        return None
+    support = s3
+
+    # Need a path between support and leaf in current graph (should be support-n2-parent-leaf)
+    path_nodes, _ = _find_path_nodes_and_edges(s, support, leaf)
+    if len(path_nodes) != 4:
+        return None
+
+    # Temporary support edge must use currently-free ports.
+    free_leaf = free_ports(s, leaf)
+    free_sup = free_ports(s, support)
+    if not free_leaf or not free_sup:
+        return None
+
+    # Try a few port pairs for temporary support.
+    port_pairs = [(ps, pl) for ps in free_sup for pl in free_leaf]
+    port_pairs = port_pairs[:8]
+
+    for ps, pl in port_pairs:
+        joint_maps = _align_ports_by_path_joints_multi(
+            s,
+            support,
+            ps,
+            leaf,
+            pl,
+            path_nodes,
+            max_tries=max_inner_tries,
+            max_solutions=max_inner_solutions,
+        )
+        if not joint_maps:
+            continue
+
+        for joints_map in joint_maps:
+            joint_actions: List[Action] = []
+            cur_q = _joints_or_zero(s)
+            for mid in sorted(joints_map.keys()):
+                tgt = joints_map[mid]
+                if cur_q.get(mid, [0.0, 0.0]) != tgt:
+                    joint_actions.append(Action(kind="SET_JOINTS", u=mid, v=mid, j1=float(tgt[0]), j2=float(tgt[1])))
+
+            # Build base state after temporary support attach
+            seq1 = joint_actions + [Action(kind="ATTACH", u=support, v=leaf, pu=ps, pv=pl)]
+            s1 = None
+            try:
+                s1 = apply_seq_fn(s, seq1)
+            except Exception:
+                s1 = None
+            if s1 is None:
+                continue
+
+            # Detach parent-leaf (should now be legal)
+            seq2 = [Action(kind="DETACH", u=parent, v=leaf)]
+            s2 = None
+            try:
+                s2 = apply_seq_fn(s1, seq2)
+            except Exception:
+                s2 = None
+            if s2 is None:
+                continue
+
+            # Now align desired ports between parent and leaf along the remaining path parent-n2-support-leaf
+            try:
+                path_nodes2, _ = _find_path_nodes_and_edges(s2, parent, leaf)
+            except Exception:
+                continue
+            joint_maps2 = _align_ports_by_path_joints_multi(
+                s2,
+                parent,
+                goal_pu,
+                leaf,
+                goal_pv,
+                path_nodes2,
+                max_tries=max_inner_tries,
+                max_solutions=max_inner_solutions,
+            )
+            if not joint_maps2:
+                continue
+            for jm2 in joint_maps2:
+                joint_actions2: List[Action] = []
+                cur_q2 = _joints_or_zero(s2)
+                for mid in sorted(jm2.keys()):
+                    tgt = jm2[mid]
+                    if cur_q2.get(mid, [0.0, 0.0]) != tgt:
+                        joint_actions2.append(
+                            Action(kind="SET_JOINTS", u=mid, v=mid, j1=float(tgt[0]), j2=float(tgt[1]))
+                        )
+                seq3 = joint_actions2 + [
+                    Action(kind="ATTACH", u=parent, v=leaf, pu=goal_pu, pv=goal_pv, twist=int(goal_twist) % 360),
+                    Action(kind="DETACH", u=support, v=leaf),
+                ]
+                s3_final = None
+                try:
+                    s3_final = apply_seq_fn(s2, seq3)
+                except Exception:
+                    s3_final = None
+                if s3_final is None:
+                    continue
+                return seq1 + seq2 + seq3
+
+    return None
 
 
 def _align_ports_by_path_joints(
@@ -329,8 +474,6 @@ def _align_ports_by_path_dp(
     and tests final T_uport->vport for position~=0 and z-opposed.
     """
     if not path_nodes or path_nodes[0] != u or path_nodes[-1] != v:
-        return None
-    if s.weld is None:
         return None
 
     allowed = _allowed_joint_pairs()
@@ -578,11 +721,11 @@ def plan_hierarchical_edge_swap(
     def pair_set(s: UBotState) -> Set[Tuple[int, int]]:
         return set((e.u, e.v) for e in edges_undirected(s))
 
-    goal_edges = edge_set(goal) if not ignore_ports else set((u, v, "", "") for (u, v) in pair_set(goal))
+    goal_edges = edge_set(goal) if not ignore_ports else set((u, v, "", "", 0) for (u, v) in pair_set(goal))
     goal_q = _joints_or_zero(goal)
 
     def h(s: UBotState) -> int:
-        cur_edges = edge_set(s) if not ignore_ports else set((u, v, "", "") for (u, v) in pair_set(s))
+        cur_edges = edge_set(s) if not ignore_ports else set((u, v, "", "", 0) for (u, v) in pair_set(s))
         cur_q = _joints_or_zero(s)
         return len(cur_edges ^ goal_edges) + sum(1 for m, v in goal_q.items() if cur_q.get(m, [0.0, 0.0]) != v)
 
@@ -692,7 +835,7 @@ def plan_hierarchical_edge_swap(
             continue
         expanded += 1
 
-        cur_edges_now = edge_set(s) if not ignore_ports else set((u, v, "", "") for (u, v) in pair_set(s))
+        cur_edges_now = edge_set(s) if not ignore_ports else set((u, v, "", "", 0) for (u, v) in pair_set(s))
         if cur_edges_now == goal_edges and _joints_or_zero(s) == goal_q:
             return path
 
@@ -718,7 +861,47 @@ def plan_hierarchical_edge_swap(
             continue
 
         # Topology step: try edge-swap moves toward missing goal edges.
-        for (u, v, pu_goal, pv_goal) in missing:
+        for (u, v, pu_goal, pv_goal, twist_goal) in missing:
+            # Special case: u-v already directly connected but with different ports (a "port switch").
+            # If detaching would isolate a leaf, try a 4-module temporary-support loop template.
+            cur_uv = _edge_between(s, u, v)
+            cur_vu = _edge_between(s, v, u)
+            if cur_uv is not None or cur_vu is not None:
+                # Determine current edge ports and which endpoint is a leaf
+                deg_u = len(s.adj.get(u, {}))
+                deg_v = len(s.adj.get(v, {}))
+                if (deg_u == 1) ^ (deg_v == 1):
+                    leaf = u if deg_u == 1 else v
+                    parent = v if leaf == u else u
+                    # only if detaching isolates (i.e., cannot detach without violating connectivity)
+                    if not _can_detach_without_isolation(s, leaf, parent):
+                        # goal ports are expressed on u and v; convert to parent/leaf directed form
+                        if parent == u and leaf == v:
+                            goal_pu2, goal_pv2, goal_tw2 = pu_goal, pv_goal, twist_goal
+                        elif parent == v and leaf == u:
+                            goal_pu2, goal_pv2, goal_tw2 = pv_goal, pu_goal, twist_goal
+                        else:
+                            goal_pu2, goal_pv2, goal_tw2 = pu_goal, pv_goal, twist_goal
+                        seq = _support_loop_port_switch_seq(
+                            s,
+                            leaf=leaf,
+                            parent=parent,
+                            goal_pu=goal_pu2,
+                            goal_pv=goal_pv2,
+                            goal_twist=int(goal_tw2) % 360,
+                            max_inner_tries=max_inner_tries,
+                            max_inner_solutions=max_inner_solutions,
+                            apply_seq_fn=apply_seq,
+                        )
+                        if seq is not None:
+                            s2 = apply_seq(s, seq)
+                            if s2 is not None:
+                                sig2 = state_sig(s2)
+                                g2 = g_cost + len(seq)
+                                if g2 < best_g.get(sig2, 10**9):
+                                    best_g[sig2] = g2
+                                    heappush(pq, (g2 + h(s2), g2, next(counter), (s2, path + seq)))
+
             # When ignoring ports, treat pu/pv from goal as a hint only.
             if not ignore_ports:
                 port_pairs = [(pu_goal, pv_goal)]
@@ -736,9 +919,9 @@ def plan_hierarchical_edge_swap(
 
             # Removable edges must lie on the created cycle and should not be required by goal.
             if not ignore_ports:
-                removable = [e for e in path_edges if (e.u, e.v, e.pu, e.pv) not in goal_edges]
+                removable = [e for e in path_edges if (e.u, e.v, e.pu, e.pv, int(e.twist) % 360) not in goal_edges]
             else:
-                goal_pairs = set((uu, vv) for (uu, vv, _a, _b) in goal_edges)
+                goal_pairs = set((uu, vv) for (uu, vv, _a, _b, _t) in goal_edges)
                 removable = [e for e in path_edges if (e.u, e.v) not in goal_pairs]
             if not removable:
                 continue
@@ -775,7 +958,16 @@ def plan_hierarchical_edge_swap(
                     for e_remove in removable:
                         seq = (
                             joint_actions
-                            + [Action(kind="ATTACH", u=u, v=v, pu=pu, pv=pv)]
+                            + [
+                                Action(
+                                    kind="ATTACH",
+                                    u=u,
+                                    v=v,
+                                    pu=pu,
+                                    pv=pv,
+                                    twist=None if ignore_ports else int(twist_goal) % 360,
+                                )
+                            ]
                             + [Action(kind="DETACH", u=e_remove.u, v=e_remove.v)]
                         )
                         s2 = apply_seq(s, seq)
@@ -808,7 +1000,7 @@ def candidate_actions(s: UBotState, goal: UBotState) -> List[Action]:
     missing_edges = sorted(g - cur)
     if missing_edges:
         involved = set()
-        for (u, v, _pu, _pv) in missing_edges:
+        for (u, v, _pu, _pv, _tw) in missing_edges:
             involved.add(u)
             involved.add(v)
         valid_pairs = _allowed_joint_pairs()
@@ -819,16 +1011,16 @@ def candidate_actions(s: UBotState, goal: UBotState) -> List[Action]:
                     actions.append(Action(kind="SET_JOINTS", u=m, v=m, j1=j1, j2=j2))
 
     # 1) detach extra edges first (keeps branching small)
-    for (u, v, _pu, _pv) in sorted(cur - g):
+    for (u, v, _pu, _pv, _tw) in sorted(cur - g):
         actions.append(Action(kind="DETACH", u=u, v=v))
 
     # 2) attach missing goal edges
-    for (u, v, pu_goal, pv_goal) in missing_edges:
+    for (u, v, pu_goal, pv_goal, twist_goal) in missing_edges:
         free_u = free_ports(s, u)
         free_v = free_ports(s, v)
 
         if pu_goal in free_u and pv_goal in free_v:
-            actions.append(Action(kind="ATTACH", u=u, v=v, pu=pu_goal, pv=pv_goal))
+            actions.append(Action(kind="ATTACH", u=u, v=v, pu=pu_goal, pv=pv_goal, twist=int(twist_goal) % 360))
             continue
 
         # fallback: try any free port pairs (small if you keep ports small)

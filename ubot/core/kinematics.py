@@ -85,7 +85,7 @@ def port_tf_in_ax(port: str, j1: float, j2: float) -> Transform:
     return tf_mul(tj, port_site_local(port))
 
 
-_FLIP_Y_PI = Transform(p=np.zeros(3), R=np.array([[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]]))
+_FLIP_X_PI = Transform(p=np.zeros(3), R=rot_x(180.0))
 
 
 def pose_tuple_to_tf(pose: Tuple[float, ...]) -> Transform:
@@ -101,47 +101,83 @@ def tf_to_pose_tuple(t: Transform) -> Tuple[float, ...]:
     R = [float(x) for x in t.R.reshape(-1).tolist()]
     return tuple(p + R)
 
-def _weld_key(u: int, pu: str, v: int, pv: str) -> tuple[int, str, int, str]:
+def _edge_key(u: int, pu: str, v: int, pv: str) -> tuple[int, str, int, str]:
     return (int(u), str(pu), int(v), str(pv))
+
+
+def edge_twist_deg(state: UBotState, u: int, pu: str, v: int, pv: str) -> int:
+    if state.twist is None:
+        return 0
+    return int(state.twist.get(_edge_key(u, pu, v, pv), 0)) % 360
 
 
 def weld_tf(state: UBotState, u: int, pu: str, v: int, pv: str) -> Transform:
     """
-    Return the stored weld transform X such that:
+    Return the rigid transform X such that:
       T_world(v_port) == T_world(u_port) * X
-    If absent, falls back to the legacy fixed flip (RotY(pi)).
+    under the model's discrete "twist about connector Z" representation.
+
+    We use the canonical attachment:
+      X = Rz(twist) * Rx(pi)
+    where Rx(pi) flips +Z to -Z while preserving +X, and `twist` is a discrete roll about the
+    connector Z axis in {0,90,180,270}.
+
+    Note: (Rz(t)*Rx(pi)) is its own inverse, so the same `twist` works for the reverse direction.
     """
-    if state.weld is not None:
-        key = _weld_key(u, pu, v, pv)
-        if key in state.weld:
-            return pose_tuple_to_tf(state.weld[key])
-    return _FLIP_Y_PI
+    t = edge_twist_deg(state, u, pu, v, pv)
+    return Transform(p=np.zeros(3), R=rot_z(float(t)) @ _FLIP_X_PI.R)
 
 
-def compute_weld_from_pose(state: UBotState, pose_map: Dict[int, Tuple[float, ...]], u: int, pu: str, v: int, pv: str) -> Transform:
+def compute_twist_from_pose(
+    state: UBotState,
+    pose_map: Dict[int, Tuple[float, ...]],
+    u: int,
+    pu: str,
+    v: int,
+    pv: str,
+    *,
+    tol_deg: float = 5.0,
+) -> int:
     """
-    Compute X such that T_world(v_port) = T_world(u_port) * X under the provided pose map.
+    Compute discrete twist (deg in {0,90,180,270}) implied by the current world port frames.
+    Assumes the ports are already aligned in world (pos coincide + Z opposed).
+
+    Twist definition: angle about parent port +Z from parent +X to child's +X after flipping
+    child's port frame by Rx(pi) so its +Z becomes aligned with parent's +Z.
     """
     Tu = port_world_tf(state, pose_map, u, pu)
     Tv = port_world_tf(state, pose_map, v, pv)
-    return tf_mul(tf_inv(Tu), Tv)
+    zu = Tu.R[:, 2]
+    xu = Tu.R[:, 0]
+    # flip child port by Rx(pi) in its own frame: x stays, y and z negate
+    xv = Tv.R[:, 0]
+    zv = -Tv.R[:, 2]
 
+    # project to plane orthogonal to z (numerical safety)
+    xu_p = xu - zu * float(np.dot(xu, zu))
+    xv_p = xv - zu * float(np.dot(xv, zu))
+    nxu = float(np.linalg.norm(xu_p))
+    nxv = float(np.linalg.norm(xv_p))
+    if nxu < 1e-9 or nxv < 1e-9:
+        return 0
+    xu_p = xu_p / nxu
+    xv_p = xv_p / nxv
 
-def ensure_welds_from_pose(state: UBotState, pose_map: Dict[int, Tuple[float, ...]]) -> None:
-    """
-    Ensure `state.weld` exists and is populated for all existing edges, using the provided poses.
-    This is used to (a) load welds from JSON `ax_pose`, and (b) freeze the attachment twist at ATTACH time.
-    """
-    if state.weld is None:
-        state.weld = {}
-    for e in edges_undirected(state):
-        key_uv = _weld_key(e.u, e.pu, e.v, e.pv)
-        key_vu = _weld_key(e.v, e.pv, e.u, e.pu)
-        if key_uv in state.weld and key_vu in state.weld:
-            continue
-        X = compute_weld_from_pose(state, pose_map, e.u, e.pu, e.v, e.pv)
-        state.weld[key_uv] = tf_to_pose_tuple(X)
-        state.weld[key_vu] = tf_to_pose_tuple(tf_inv(X))
+    # Ensure z alignment direction is as expected (best-effort; validation happens elsewhere)
+    if float(np.dot(zu, zv)) < 0.5:
+        # If flipping didn't align z, still compute angle in parent's frame.
+        pass
+
+    sinv = float(np.dot(zu, np.cross(xu_p, xv_p)))
+    cosv = float(np.dot(xu_p, xv_p))
+    ang = math.degrees(math.atan2(sinv, cosv)) % 360.0
+    k = int(round(ang / 90.0)) % 4
+    snap = int(k * 90)
+    # compute smallest angular error
+    err = abs(((ang - snap + 180.0) % 360.0) - 180.0)
+    if err > tol_deg:
+        raise ValueError(f"Computed twist {ang:.2f}deg not near a multiple of 90deg (err={err:.2f}).")
+    return snap
 
 
 def solve_from_anchor(
@@ -215,13 +251,13 @@ def ports_aligned(
 
 def propagate_poses_3d(state: UBotState, root_z: float = 0.0) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
     """
-    Kinematic solve of module ax world poses using attachment weld constraints.
+    Kinematic solve of module ax world poses using attachment twist constraints.
 
     - Root ax0 is fixed in world: position (0,root_z,0), rotation = Identity.
     - Internal joints rotate ma/mb, affecting port transforms relative to ax.
     - For an attachment edge u.pu -- v.pv, enforce:
         T_world(v_port) = T_world(u_port) * X_uv
-      where X_uv is stored in `state.weld` (frozen at ATTACH time). If missing, uses legacy RotY(pi).
+      where X_uv == Rz(twist)*Rx(pi) and `twist` is stored in `state.twist` (deg in {0,90,180,270}).
     """
     if state.pose is None or 0 not in state.pose:
         root_pose = tf_to_pose_tuple(Transform(p=np.array([0.0, root_z, 0.0]), R=np.eye(3)))

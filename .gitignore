@@ -33,6 +33,7 @@ scene_*.xml
 tmp*.xml
 *.log
 *.jsonl
+*.mp4
 
 # ===== Local scratch JSON =====
 random_state*.json

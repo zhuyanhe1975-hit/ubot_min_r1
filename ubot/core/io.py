@@ -5,7 +5,6 @@ from ubot.core.types import Edge, UBotState
 from ubot.core.graph import empty_state, add_edge
 from ubot.core.graph import edges_undirected, compute_parent_map
 from ubot.core.validator import validate_joints
-from ubot.core.layout import layout_from_ports
 
 def load_state_json(path: str) -> UBotState:
     with open(path, "r", encoding="utf-8") as f:
@@ -18,7 +17,10 @@ def load_state_json(path: str) -> UBotState:
         pv = ed["pv"]
         if pu not in ports or pv not in ports:
             raise ValueError(f"Edge uses unknown port: {pu}/{pv}")
-        add_edge(s, Edge(u=ed["u"], v=ed["v"], pu=pu, pv=pv))
+        twist = int(ed.get("twist", 0)) % 360
+        if twist not in (0, 90, 180, 270):
+            raise ValueError(f"Edge twist must be in {{0,90,180,270}}, got {twist}")
+        add_edge(s, Edge(u=ed["u"], v=ed["v"], pu=pu, pv=pv, twist=twist))
     joints = data.get("joints")
     if joints is not None:
         # keys might come in as strings; normalize to ints
@@ -29,35 +31,23 @@ def load_state_json(path: str) -> UBotState:
 
     s.parent = compute_parent_map(s, root=0)
 
-    # Initialize / load ax world poses (pose is 12-float tuple: p + R row-major).
+    # Optional: allow seeding the root ax0 world pose; by default keep it fixed at origin identity.
     poses_in = data.get("ax_pose")
+    s.pose = {}
     if poses_in is not None:
-        s.pose = {int(k): tuple(float(x) for x in v["pose"]) for k, v in poses_in.items()}
-    else:
-        # Deterministic placement from port-layout; uses 0.1 m grid for initial anchors.
-        grid = layout_from_ports(s).grid_xy
-        s.pose = {}
-        for m in modules:
-            gx, gy = grid.get(m, (0, 0))
-            s.pose[m] = (gx * 0.1, 0.0, gy * 0.1, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+        for k, v in poses_in.items():
+            s.pose[int(k)] = tuple(float(x) for x in v["pose"])
+    if 0 not in s.pose:
         s.pose[0] = (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
 
-        # Solve connected component of 0 to satisfy existing edges
-        from ubot.core.kinematics import solve_from_anchor, tf_to_pose_tuple, Transform
-        import numpy as np
-
-        solved = solve_from_anchor(s, 0, s.pose[0])
-        for mid, (p, R) in solved.items():
-            s.pose[mid] = tf_to_pose_tuple(Transform(p=np.array(p), R=np.array(R)))
-
-    # Freeze weld transforms for existing edges based on the current poses.
-    from ubot.core.kinematics import ensure_welds_from_pose
-
-    ensure_welds_from_pose(s, s.pose)
-
     # Enforce geometric consistency of existing connections using our kinematics model.
-    from ubot.core.kinematics import propagate_poses_3d, edge_geometry_ok
+    from ubot.core.kinematics import propagate_poses_3d, edge_geometry_ok, tf_to_pose_tuple, Transform
+    import numpy as np
+
     poses = propagate_poses_3d(s)
+    # materialize into s.pose for downstream (viewer / planner / validator) usage
+    for mid, (p, R) in poses.items():
+        s.pose[mid] = tf_to_pose_tuple(Transform(p=np.array(p), R=np.array(R)))
     if not edge_geometry_ok(s, poses):
         raise ValueError("State edges violate geometric connection rule (pos coincide + Z opposed).")
     # Enforce "no floating modules/branches" constraints.

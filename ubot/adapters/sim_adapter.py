@@ -8,9 +8,7 @@ from ubot.core.kinematics import (
     tf_to_pose_tuple,
     pose_tuple_to_tf,
     Transform,
-    ensure_welds_from_pose,
-    compute_weld_from_pose,
-    tf_inv,
+    compute_twist_from_pose,
 )
 
 class SimAdapter(UBotAdapter):
@@ -24,7 +22,6 @@ class SimAdapter(UBotAdapter):
             # if caller didn't provide poses, initialize module0 at origin identity and others at origin
             self._state.pose = {m: (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0) for m in self._state.adj.keys()}
             self._state.pose[0] = (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-        ensure_welds_from_pose(self._state, self._state.pose)
         self._update_poses()
 
     def get_state(self) -> UBotState:
@@ -33,21 +30,15 @@ class SimAdapter(UBotAdapter):
     def apply(self, action: Action) -> None:
         validate_action(self._state, action)
         if action.kind == "DETACH":
-            # Remove weld entries for the edge before removing it from adjacency.
-            if self._state.weld is not None:
-                for pu, (vv, pv) in list(self._state.adj.get(action.u, {}).items()):
-                    if vv == action.v:
-                        self._state.weld.pop((action.u, pu, action.v, pv), None)
-                        self._state.weld.pop((action.v, pv, action.u, pu), None)
             remove_edge(self._state, action.u, action.v)
         elif action.kind == "ATTACH":
-            add_edge(self._state, Edge(u=action.u, v=action.v, pu=action.pu, pv=action.pv))
-            # Freeze weld at the current aligned pose (no teleport).
-            if self._state.pose is not None:
-                ensure_welds_from_pose(self._state, self._state.pose)
-                X = compute_weld_from_pose(self._state, self._state.pose, action.u, action.pu, action.v, action.pv)
-                self._state.weld[(action.u, action.pu, action.v, action.pv)] = tf_to_pose_tuple(X)
-                self._state.weld[(action.v, action.pv, action.u, action.pu)] = tf_to_pose_tuple(tf_inv(X))
+            twist = int(action.twist) % 360 if action.twist is not None else None
+            if twist is None:
+                # Infer discrete twist from the current aligned world frames (no teleport).
+                if self._state.pose is None:
+                    raise RuntimeError("Missing pose while inferring ATTACH twist.")
+                twist = compute_twist_from_pose(self._state, self._state.pose, action.u, action.pu, action.v, action.pv)
+            add_edge(self._state, Edge(u=action.u, v=action.v, pu=action.pu, pv=action.pv, twist=twist))
         else:  # SET_JOINTS
             if self._state.q is None:
                 self._state.q = {}
