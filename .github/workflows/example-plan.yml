@@ -1,0 +1,76 @@
+# Plan examples/start.json -> examples/goal.json and publish the log.
+#
+# Default A* exhausts --max_expand on this pair without a plan: ATTACH is legal
+# only when the ports are already aligned. The hierarchical planner solves the
+# same files in a few seconds on CPU, so that is the required demo.
+#
+# The MuJoCo viewer is intentionally omitted. It imports a GUI viewer and is not
+# reliable on a headless ubuntu-latest runner. A viewer failure must not fail CI.
+
+name: Example plan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: example-plan-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    name: Plan example start/goal
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: python -m pip install -e .
+
+      - name: Run example planner
+        id: plan
+        run: |
+          mkdir -p ci-out
+          set +e
+          python -m ubot.apps.run_plan \
+            --start examples/start.json \
+            --goal examples/goal.json \
+            --planner hier \
+            --out ci-out/ubot_run_log.json \
+            >ci-out/plan.log 2>&1
+          code=$?
+          set -e
+          cat ci-out/plan.log
+          echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
+          exit "${code}"
+
+      - name: Write job summary
+        if: always()
+        env:
+          PLAN_EXIT_CODE: ${{ steps.plan.outputs.exit_code }}
+          PLAN_LOG: ci-out/ubot_run_log.json
+          PLAN_STDOUT: ci-out/plan.log
+          PLAN_SUMMARY_MD: ci-out/summary.md
+        run: python .github/scripts/summarize_plan.py
+
+      - name: Upload plan artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ubot-example-plan
+          path: ci-out/
+          if-no-files-found: warn
+          retention-days: 14

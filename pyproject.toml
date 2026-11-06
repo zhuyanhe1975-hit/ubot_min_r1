@@ -7,3 +7,9 @@ name = "ubot-min"
 version = "0.1.0"
 description = "Minimal runnable UBot reconfiguration planner"
 requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.23",
+]
+
+[tool.setuptools.packages.find]
+include = ["ubot*"]
