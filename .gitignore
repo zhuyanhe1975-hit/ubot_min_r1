@@ -38,6 +38,9 @@ tmp*.xml
 # ===== Local scratch JSON =====
 random_state*.json
 
+# ===== GitHub Actions local outputs =====
+ci-out/
+
 # ===== OS =====
 .DS_Store
 Thumbs.db
